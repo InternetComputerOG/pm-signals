@@ -109,6 +109,7 @@ All of these live in [`src/lib/config.ts`](src/lib/config.ts).
 | `TRADES_LIMIT` | 200 | 200 | Unchanged. |
 | `HISTORY_WINDOW_DAYS` | 10 | 10 | Unchanged. |
 | `MAX_MARKETS_PER_RUN` | 12 | — | Free-plan Workers allow 50 subrequests per invocation; 12 markets keeps a worst-case run near 37. |
+| `REFRESH_COOLDOWN_MINUTES` | 10 | — | How long `POST /refresh` declines after the last recorded observation. |
 
 The conjunction on large trades has a deliberate and visible consequence: away from resolution
 dates almost no earnings market has $1,000 prints — on the busiest open market the largest fill was
@@ -152,9 +153,10 @@ Cron (every 12h)
   -> D1     signal_history              one append-only row per selected market
 
 HTTP
-  GET /            server-rendered cards in three tiers, chart data embedded
-  GET /feed.json   the same rolling window as JSON
-  GET /style.css   served from public/ by Workers Static Assets
+  GET  /            server-rendered cards in three tiers, chart data embedded
+  GET  /feed.json   the same rolling window as JSON
+  POST /refresh     runs the pass above on demand, subject to a cooldown
+  GET  /style.css   served from public/ by Workers Static Assets
 ```
 
 ```
@@ -171,7 +173,7 @@ HTTP
         ├── alpaca.ts         snapshot + bars, degrades to null, never throws
         ├── signals.ts        pure scoring math
         ├── pipeline.ts       selection + the scheduled pass
-        ├── db.ts             D1 helpers
+        ├── db.ts             D1 helpers, timestamp handling, refresh cooldown
         └── render.ts         server-rendered HTML, tier derivation
 ```
 
@@ -216,8 +218,16 @@ npx wrangler d1 execute pead-whale --local \
   --command "SELECT ticker, p_beat, imbalance, strength, recorded_at FROM signal_history ORDER BY strength DESC"
 ```
 
+You can also hit the manual trigger instead of the `__scheduled` URL, which is the same pass and
+returns a summary of what it did:
+
 ```bash
-npm test        # 92 unit tests over scoring, selection, rendering, and the Alpaca client
+curl -X POST http://localhost:8787/refresh
+# {"status":"ok","discovered":26,"selected":7,"scored":7,"recorded":7,"skipped":0}
+```
+
+```bash
+npm test        # 105 unit tests over scoring, selection, rendering, timestamps, and Alpaca
 npm run typecheck
 ```
 
@@ -246,6 +256,35 @@ on the two missing columns. SQLite has no `ADD COLUMN IF NOT EXISTS`, so this is
 ```bash
 npx wrangler d1 execute pead-whale --remote --file migrations/0001_radar_tier.sql
 ```
+
+### Populating a fresh deploy
+
+The cron fires at 00:00 and 12:00 UTC, so a deployment can be followed by up to 12 hours of an
+empty page with nothing actually wrong. Trigger a pass yourself instead:
+
+```bash
+curl -X POST https://your-worker.workers.dev/refresh
+# {"status":"ok","discovered":26,"selected":7,"scored":7,"recorded":7,"skipped":0}
+```
+
+It returns the run summary, so it doubles as a post-deploy smoke test: a non-zero `recorded` proves
+the Worker reached Gamma, CLOB and D1 in production.
+
+Within `REFRESH_COOLDOWN_MINUTES` of the last recorded observation it declines with a 429 and a
+`Retry-After` header rather than running again:
+
+```json
+{ "status": "cooldown", "retry_after_seconds": 600, "last_recorded_at": "2026-08-07T20:25:44Z" }
+```
+
+Three things about this endpoint are deliberate. It is **POST, not GET**, because it has side
+effects and a GET would eventually be fired by a prefetcher, uptime monitor or crawler — a GET to
+`/refresh` is a plain 404. It is **unauthenticated**, because this is a public showcase with no
+secret worth managing. And the **cooldown is the safeguard that matters**, since the real risk is
+cost rather than disclosure: a pass spends ~37 subrequests against a finite daily allowance, so an
+unbounded refresh is the one thing a visitor could use to break the free tier. The cron's own
+writes reset the timer too, which is correct — if data landed five minutes ago there is nothing to
+refresh.
 
 ### Secrets
 
@@ -283,7 +322,15 @@ per run against a 50 limit. There is no LLM inference anywhere in the system.
 
 ---
 
-## `GET /feed.json`
+## Endpoints
+
+| Route | Purpose |
+| --- | --- |
+| `GET /` | The dashboard: cards in three tiers, chart data embedded in the document. |
+| `GET /feed.json` | The same rolling 10-day window as JSON, oldest first. |
+| `POST /refresh` | Runs the discovery pass on demand and returns its summary. Rate-limited; see above. |
+
+### `GET /feed.json`
 
 The same rolling 10-day window the page uses, oldest first.
 

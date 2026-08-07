@@ -39,6 +39,39 @@ export function toIso(sqliteTimestamp: string): string {
   return `${sqliteTimestamp.replace(" ", "T")}Z`;
 }
 
+/**
+ * Seconds before another manual refresh is allowed; 0 when one may run now.
+ * Doubles as the `Retry-After` value, which is why it returns seconds rather
+ * than a boolean.
+ *
+ * Lives here rather than in the route because it is entirely a question about
+ * `recorded_at`, whose format is this module's concern - the same reason
+ * toIso() is here.
+ *
+ * **Fails open.** No rows yet, or a timestamp that will not parse, both permit
+ * the run. A fresh deployment has an empty table and is precisely the case the
+ * endpoint exists for, so a null must not be mistaken for "just ran"; and a
+ * malformed value should not be able to wedge the endpoint shut permanently.
+ */
+export function cooldownRemainingSeconds(
+  latestRecorded: string | null,
+  now: number,
+  cooldownMinutes: number,
+): number {
+  if (!latestRecorded) return 0;
+
+  const at = Date.parse(toIso(latestRecorded));
+  if (Number.isNaN(at)) return 0;
+
+  const windowMs = cooldownMinutes * 60_000;
+  const elapsed = now - at;
+  if (elapsed >= windowMs) return 0;
+
+  // A timestamp in the future (clock skew) yields the full window rather than
+  // a nonsensical value, since elapsed is negative and capped by the window.
+  return Math.min(Math.ceil((windowMs - elapsed) / 1000), Math.ceil(windowMs / 1000));
+}
+
 export async function insertObservation(db: D1Database, row: NewObservation): Promise<void> {
   await db
     .prepare(
@@ -83,6 +116,19 @@ export async function getRecentlySeenMarketIds(
     .bind(`-${days} days`)
     .all<{ market_id: string }>();
   return new Set((results ?? []).map((r) => r.market_id));
+}
+
+/**
+ * Timestamp of the most recent observation, or null on an empty table.
+ *
+ * Unwindowed on purpose: this answers "when did a pass last write anything",
+ * which the refresh cooldown needs, not "what is currently active".
+ */
+export async function latestRecordedAt(db: D1Database): Promise<string | null> {
+  const row = await db
+    .prepare("SELECT MAX(recorded_at) AS latest FROM signal_history")
+    .first<{ latest: string | null }>();
+  return row?.latest ?? null;
 }
 
 /** Full rolling window, oldest first, which is the order the charts want. */

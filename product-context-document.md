@@ -4,9 +4,9 @@
 
 | | |
 | --- | --- |
-| Version | 2.2 |
+| Version | 2.3 |
 | Status | Deployed on Cloudflare Free (workers.dev), D1 + cron configured |
-| Supersedes | v2.1 (volume-gated discovery), v2.0 (Alpaca unconfigured), v1.0 (pre-implementation draft) |
+| Supersedes | v2.2 (cron-only refresh), v2.1 (volume-gated discovery), v2.0 (Alpaca unconfigured), v1.0 (pre-implementation draft) |
 | Last verified against live data | 2026-08-07 |
 
 > **Read this first.** v1.0 of this document was written before any code existed. Implementing it
@@ -29,6 +29,12 @@
 > approaching the filter so their drift is visible before they cross it
 > ([Section 6](#6-publication--history-rules)). See [Section 18.10](#1810-the-volume-gate-selected-against-the-thesis)
 > for the evidence and [Section 19](#19-observed-baseline-2026-08-07) for the refreshed baseline.
+>
+> **v2.3 adds `POST /refresh`**, because deploying v2.2 exposed a gap the design had: the table is
+> written only by a cron that fires twice a day, so a deployment landing at 20:02 UTC showed an
+> empty page until midnight with nothing wrong. See
+> [Section 12](#post-refresh) for the endpoint and [Section 18.11](#1811-a-fresh-deployment-had-no-way-to-populate-itself)
+> for what the incident also revealed about the empty state's wording.
 
 ---
 
@@ -469,9 +475,10 @@ Cron (every 12h)
   -> D1     signal_history              one append-only row per selected market
 
 HTTP
-  GET /            server-rendered cards in three tiers, chart data embedded in the document
-  GET /feed.json   the same rolling window as JSON
-  GET /style.css   served from public/ by Workers Static Assets
+  GET  /            server-rendered cards in three tiers, chart data embedded in the document
+  GET  /feed.json   the same rolling window as JSON
+  POST /refresh     runs the pass above on demand, subject to a cooldown
+  GET  /style.css   served from public/ by Workers Static Assets
 ```
 
 Markets are scored with a bounded concurrency of `SCORING_CONCURRENCY = 4`.
@@ -528,13 +535,15 @@ the frontend.
         ├── signals.test.ts
         ├── pipeline.test.ts
         ├── render.test.ts
+        ├── db.test.ts
         └── alpaca.test.ts
 ```
 
 Three files are additions to v1.0's structure: `config.ts` (so no threshold is buried in a
 function body), `pipeline.ts` (so `index.ts` stays a thin entry point), and `render.ts`.
 `alpaca.test.ts` was added in v2.1, when the client stopped being hypothetical. `migrations/` and
-`pipeline.test.ts` were added in v2.2 with the radar tier.
+`pipeline.test.ts` were added in v2.2 with the radar tier, and `db.test.ts` in v2.3 with the
+refresh cooldown.
 
 ---
 
@@ -599,6 +608,10 @@ crons = ["0 */12 * * *"]
 
 The handler performs full rediscovery, scoring, and history insertion in one pass, and is `await`ed
 rather than handed to `waitUntil` so a failure surfaces as a failed scheduled invocation.
+
+**Twice a day is the only automatic write path**, which means a deployment can land up to 12 hours
+before the page has anything to show. `POST /refresh` (Section 12) exists to close that window; see
+18.11 for the rollout that made the gap obvious.
 
 In local development the timer does not fire. Trigger a pass by hand against
 `wrangler dev --test-scheduled`:
@@ -679,6 +692,43 @@ The same rolling 10-day window, oldest first, with `recorded_at` converted to IS
 That row is a radar observation: `strength` is 0 because `p_beat` is above the 0.30 filter, not
 because anything failed. Consumers distinguishing tiers should read `p_beat`, per Section 6.2.
 
+### `POST /refresh`
+
+Runs the scheduled pass on demand and returns its `RunSummary`, so a fresh deployment does not sit
+empty until the next cron.
+
+```bash
+curl -X POST https://pm-signals.small-unit-9fb3.workers.dev/refresh
+```
+
+```json
+{ "status": "ok", "discovered": 26, "selected": 7, "scored": 7, "recorded": 7, "skipped": 0 }
+```
+
+Within `REFRESH_COOLDOWN_MINUTES` of the most recent recorded observation it declines instead,
+with a `Retry-After` header carrying the same figure:
+
+```json
+{ "status": "cooldown", "retry_after_seconds": 600, "last_recorded_at": "2026-08-07T20:25:44Z" }
+```
+
+Three decisions worth keeping:
+
+- **POST, not GET.** The route has side effects, and a GET would eventually be fired by a
+  prefetcher, uptime monitor or crawler — each firing a full pass. A GET to `/refresh` is a plain
+  404.
+- **No authentication.** This is a public showcase with no secret worth managing, and the real risk
+  is cost rather than disclosure.
+- **The cooldown is the safeguard.** A pass spends roughly 37 subrequests against a finite daily
+  allowance, so an unbounded refresh is the one thing a visitor could use to break the free tier.
+  The cron's own writes reset the timer too, which is correct: if data landed five minutes ago
+  there is nothing to refresh.
+
+`cooldownRemainingSeconds` **fails open** — an empty table or an unparseable timestamp both permit
+the run. A fresh deployment has an empty table and is exactly the case the endpoint exists for, so
+a null must never read as "just ran", and a malformed value must not be able to wedge the endpoint
+shut permanently.
+
 `imbalance` is in `[-1, 1]`; **negative means net selling pressure against the beat**.
 
 ---
@@ -733,6 +783,7 @@ code sample, real keys must never reach a commit.
 | `LARGE_TRADE_TOP_PERCENTILE` | `0.05` | — | The other half. See 5.2 |
 | `TRADES_LIMIT` | `200` | `200` | Unchanged |
 | `HISTORY_WINDOW_DAYS` | `10` | `10` | Unchanged |
+| `REFRESH_COOLDOWN_MINUTES` | `10` | — | Rate limit on `POST /refresh`. See 12 |
 | `GAMMA_SEARCH_LIMIT_PER_TYPE` | `50` | `50` | Unchanged |
 | `MAX_MARKETS_PER_RUN` | `12` | — | Free-tier subrequest guard. See 13.1 |
 | `SCORING_CONCURRENCY` | `4` | — | Bounded parallelism |
@@ -770,6 +821,11 @@ and in practice the snapshot answers on the first call.
 D1 queries do not count against the subrequest limit.
 
 Two cron invocations per day sit far inside the 100k requests/day allowance.
+
+`POST /refresh` runs the same pass and so costs the same ~37 subrequests, but it is publicly
+callable, which makes it the only path by which a visitor could consume the daily budget. That is
+what `REFRESH_COOLDOWN_MINUTES` bounds: at worst 6 passes an hour, or 144 a day, against an
+allowance measured in tens of thousands of requests.
 
 ---
 
@@ -835,7 +891,7 @@ Specifics learned during implementation:
 
 ### 17.1 Testing
 
-92 tests across four files, all hermetic — no network, no database, no fixtures on disk.
+105 tests across five files, all hermetic — no network, no database, no fixtures on disk.
 
 - `signals.test.ts` — the scoring functions including boundary cases (`pBeat` exactly `0.30`,
   imbalance exactly `-0.30` / `-0.70`, the 60 and 100 caps), `topPercentileThreshold`,
@@ -848,6 +904,11 @@ Specifics learned during implementation:
 - `render.test.ts` — tier derivation, ordering by *latest* strength with the `p_beat` tiebreak,
   section grouping, drift, resolution formatting, null-column degradation, the empty state, HTML
   escaping, and `</script>` neutralisation in the embedded JSON.
+- `db.test.ts` — added in v2.3. `toIso`, and every branch of `cooldownRemainingSeconds`: the empty
+  table, mid-window and elapsed-window, a future timestamp from clock skew, an unparseable value,
+  a zero-minute cooldown, and the shipped `REFRESH_COOLDOWN_MINUTES`. One test pins that SQLite's
+  space-separated format is read as UTC — parsing it as local time would shift the cooldown by the
+  host's offset and, west of UTC, make every fresh row look hours old.
 - `alpaca.test.ts` — added in v2.1, with `fetch` stubbed and the response bodies copied from the
   live free-tier calls in Section 3.2. Covers the auth headers and IEX feed parameter, the
   three-level price precedence, rejection of zero and non-finite prices, the bars window and
@@ -907,7 +968,12 @@ two missing columns:
 ```bash
 npx wrangler d1 execute pead-whale --remote --file migrations/0001_radar_tier.sql
 npx wrangler deploy
+curl -X POST https://pm-signals.small-unit-9fb3.workers.dev/refresh
 ```
+
+The `curl` is what stops a deploy from showing an empty page until the next cron. It returns the
+run summary, so it also doubles as a post-deploy smoke test — a non-zero `recorded` proves the
+Worker reached Gamma, CLOB and D1 in production.
 
 ---
 
@@ -1038,6 +1104,43 @@ to admit *some* markets, never to admit the *right* ones.
 Corrected by ranking on `fallbackPBeat`, which discovery already parses, so the fix costs no
 additional subrequest. Pinned by the regression test in Section 17.1.
 
+### 18.11 A fresh deployment had no way to populate itself
+
+Found by deploying v2.2. The rollout landed at 20:02 UTC; the cron fires at 00:00 and 12:00 UTC, so
+the last opportunity had passed eight hours earlier and the next was four hours away. The page
+showed its empty state, and everything was working correctly.
+
+Two separate defects, and the second is the more instructive one.
+
+**The table is written only by the cron.** With a twice-daily trigger, any deploy can be followed
+by up to 12 hours of an empty page. That is fine for a system nobody is watching and wrong for a
+showcase, whose entire purpose is to be looked at. Fixed with `POST /refresh` (Section 12).
+
+**The empty state asserted a cause it could not possibly know.** The v2.2 copy read:
+
+> No earnings markets open — Polymarket is not currently listing any open earnings markets, so
+> there is nothing to track at any tier.
+
+`renderPage` receives `rows` and nothing else. It knows `rows.length === 0`. It cannot distinguish
+"the cron has never run", "the cron ran and Polymarket returned nothing", or "the cron ran, found
+markets, and every insert failed" — yet it named the second as fact. Polymarket was in fact serving
+26 open earnings markets at that moment, 7 of them under the radar ceiling.
+
+The cost was not the blank page, which was momentary and correct. It was that the page sent its
+reader to debug a healthy API. **A message that guesses at a cause is worse than one that admits
+it does not know**, because a plausible wrong explanation is acted on and a missing one is
+investigated.
+
+The v2.2 empty-state wording is still in place — with the refresh endpoint the state is now rare —
+but it is a known defect, recorded in Section 20 rather than in the corrections, because it has not
+been corrected.
+
+The deeper gap is structural: **the app records observations but no record of runs**. A `run_log`
+table holding one row per pass (timestamp, discovered, selected, recorded) would let the page state
+facts instead of inferring them — "last scanned 3h ago, 26 markets seen, 8 tracked" — and would
+have made this diagnosis immediate. It was considered during the v2.2 design and dropped as
+over-engineering. This incident is the argument against that call.
+
 ---
 
 ## 19. Observed baseline (2026-08-07)
@@ -1088,6 +1191,12 @@ Not defects — deliberate boundaries, recorded so they are not rediscovered.
 
 - **Signal has never been validated.** No backtest, no out-of-sample check. The scores are a faithful
   encoding of a paper's stated conditions, nothing more.
+- **The empty state still names a cause it cannot know**, claiming Polymarket lists no open
+  earnings markets whenever the table is empty for any reason. See 18.11. Left as-is because
+  `POST /refresh` makes the state rare, but it is a defect, not a decision.
+- **No record of runs, only of observations.** Nothing distinguishes "the pass has never run" from
+  "it ran and found nothing", for either the page or an operator. A `run_log` table would fix both
+  this and the item above, and is the natural next change.
 - **`RADAR_PBEAT_CEILING = 0.50` and `MIN_TRACKED_MARKETS = 6` are editorial, not empirical.** The
   paper says nothing about markets above 0.30, so the radar tier's width is a judgement about what
   is worth watching, chosen to keep the board populated on the boards observed so far. It is not a

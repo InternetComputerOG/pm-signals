@@ -130,6 +130,27 @@ export const LARGE_TRADE_TOP_PERCENTILE = 0.05;
 export const HISTORY_WINDOW_DAYS = 10;
 
 // ---------------------------------------------------------------------------
+// Manual refresh
+// ---------------------------------------------------------------------------
+
+/**
+ * How long POST /refresh refuses to run again after the last recorded
+ * observation.
+ *
+ * The endpoint is deliberately unauthenticated - this is a public showcase
+ * with no secret worth protecting - so the cooldown, not a key, is what keeps
+ * it from being the one way a visitor could break the free tier. A pass costs
+ * roughly 37 subrequests and up to 12 inserts, and the daily allowance is
+ * finite.
+ *
+ * Ten minutes is short enough to be invisible while deploying or demoing, and
+ * long enough that a loop against the endpoint achieves nothing. Note the
+ * cron's own writes reset it too, which is correct: if data landed five
+ * minutes ago there is nothing to refresh.
+ */
+export const REFRESH_COOLDOWN_MINUTES = 10;
+
+// ---------------------------------------------------------------------------
 // Alpaca (free tier, IEX feed only)
 // ---------------------------------------------------------------------------
 
