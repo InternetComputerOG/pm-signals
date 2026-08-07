@@ -9,6 +9,10 @@ CREATE TABLE IF NOT EXISTS signal_history (
   strength INTEGER NOT NULL,
   current_stock_price REAL,
   pm_url TEXT,
+  -- Both nullable: added after the table shipped, so rows recorded before the
+  -- radar tier read back as NULL. See migrations/0001_radar_tier.sql.
+  resolution_date TEXT,
+  volume REAL,
   recorded_at TEXT DEFAULT (datetime('now'))
 );
 

@@ -27,8 +27,14 @@ export interface Candidate {
   pmUrl: string;
   volume: number;
   ticker: string;
-  /** Gamma's own last outcome price, used only if the CLOB midpoint call fails. */
+  /**
+   * Gamma's own last outcome price. Used as the fallback if the CLOB midpoint
+   * call fails, and as the free ranking key during selection - it arrives with
+   * discovery, so ranking on it costs no subrequest.
+   */
   fallbackPBeat: number | null;
+  /** ISO-8601 resolution date, when Gamma supplies one. Display context only. */
+  endDate: string | null;
 }
 
 interface GammaMarket {
@@ -41,6 +47,7 @@ interface GammaMarket {
   acceptingOrders?: boolean;
   volume?: number | string;
   volumeNum?: number | string;
+  endDate?: string;
   /** JSON-encoded string, e.g. '["123...","456..."]'. */
   clobTokenIds?: string;
   /** JSON-encoded string, e.g. '["Yes", "No"]'. */
@@ -55,6 +62,7 @@ interface GammaEvent {
   active?: boolean;
   closed?: boolean;
   archived?: boolean;
+  endDate?: string;
   markets?: GammaMarket[];
 }
 
@@ -190,6 +198,7 @@ function candidatesFromEvent(event: GammaEvent): Candidate[] {
       volume: toNumber(market.volumeNum ?? market.volume),
       ticker,
       fallbackPBeat: Number.isFinite(parsedFallback) ? parsedFallback : null,
+      endDate: market.endDate ?? event.endDate ?? null,
     });
   }
   return out;

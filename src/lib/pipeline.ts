@@ -15,10 +15,10 @@ import {
   LARGE_TRADE_ABSOLUTE_FLOOR,
   LARGE_TRADE_TOP_PERCENTILE,
   MAX_MARKETS_PER_RUN,
-  MIN_RECORD_SCORE,
+  MIN_TRACKED_MARKETS,
+  RADAR_PBEAT_CEILING,
   SCORING_CONCURRENCY,
-  VOLUME_ABSOLUTE_FLOOR,
-  VOLUME_TOP_PERCENTILE,
+  TRACKED_PRIORITY_BONUS,
 } from "./config";
 import { getRecentlySeenMarketIds, insertObservation } from "./db";
 import {
@@ -40,26 +40,56 @@ export interface Env extends AlpacaEnv {
 
 export interface RunSummary {
   discovered: number;
-  gated: number;
+  selected: number;
   scored: number;
   recorded: number;
   skipped: number;
 }
 
 /**
- * Volume gate: absolute floor OR the top slice of today's board.
+ * Choose which markets are worth spending the subrequest budget on.
  *
- * Splitting these is what keeps the dashboard populated between earnings
- * seasons, when no open market anywhere is near the absolute floor.
+ * Ranks on Gamma's own YES outcome price, which discovery has already parsed
+ * into fallbackPBeat and which therefore costs nothing extra. It is a slightly
+ * stale proxy for the CLOB midpoint fetched later, but with a ceiling at 0.50
+ * against a filter at 0.30 there is ample margin for the drift between them.
+ *
+ * This replaces a volume gate that ran before any signal consideration and cut
+ * the board to its top 10% by liquidity. That ordering was backwards: volume
+ * on earnings markets concentrates in the names the crowd expects to beat,
+ * which is the opposite of what a short-side thesis wants. On the live board
+ * of 2026-08-07 it admitted three markets priced 0.30, 0.79 and 0.85, and
+ * discarded all five that passed the primary filter, so nothing was recorded.
+ *
+ * Volume survives only as a tiebreak, and as a "thin book" label on the card.
+ *
+ * Three rules, in order:
+ *   1. Rank by price ascending, tracked markets discounted so a series in
+ *      progress keeps extending.
+ *   2. Admit everything at or below RADAR_PBEAT_CEILING, plus anything already
+ *      tracked, so decays and reversals stay visible.
+ *   3. If that yields fewer than MIN_TRACKED_MARKETS, backfill with the
+ *      cheapest remaining markets regardless of the ceiling. This is what
+ *      guarantees a populated dashboard when the whole board is priced high.
  */
-export function applyVolumeGate(candidates: Candidate[]): Candidate[] {
-  const relativeFloor = topPercentileThreshold(
-    candidates.map((c) => c.volume),
-    VOLUME_TOP_PERCENTILE,
+export function selectCandidates(
+  candidates: Candidate[],
+  tracked: ReadonlySet<string>,
+): Candidate[] {
+  // A missing price sorts last rather than first: unknown is not cheap.
+  const rank = (c: Candidate) =>
+    (c.fallbackPBeat ?? 1) - (tracked.has(c.marketId) ? TRACKED_PRIORITY_BONUS : 0);
+
+  const ordered = [...candidates].sort((a, b) => rank(a) - rank(b) || b.volume - a.volume);
+
+  const eligible = ordered.filter(
+    (c) => (c.fallbackPBeat ?? 1) <= RADAR_PBEAT_CEILING || tracked.has(c.marketId),
   );
-  return candidates.filter(
-    (c) => c.volume >= VOLUME_ABSOLUTE_FLOOR || c.volume >= relativeFloor,
-  );
+
+  const filled =
+    eligible.length >= MIN_TRACKED_MARKETS ? eligible : ordered.slice(0, MIN_TRACKED_MARKETS);
+
+  return filled.slice(0, MAX_MARKETS_PER_RUN);
 }
 
 /**
@@ -102,7 +132,7 @@ async function mapWithConcurrency<T>(
 }
 
 export async function runDiscoveryPass(env: Env): Promise<RunSummary> {
-  const summary: RunSummary = { discovered: 0, gated: 0, scored: 0, recorded: 0, skipped: 0 };
+  const summary: RunSummary = { discovered: 0, selected: 0, scored: 0, recorded: 0, skipped: 0 };
 
   if (!hasAlpacaCredentials(env)) {
     console.warn("alpaca: no credentials configured, stock prices will be recorded as null");
@@ -115,16 +145,14 @@ export async function runDiscoveryPass(env: Env): Promise<RunSummary> {
     return summary;
   }
 
-  // Rank by volume before capping, so the subrequest budget is spent on the
-  // markets most likely to carry a real signal.
-  const gated = applyVolumeGate(discovered)
-    .sort((a, b) => b.volume - a.volume)
-    .slice(0, MAX_MARKETS_PER_RUN);
-  summary.gated = gated.length;
-
+  // Read the tracked set first: selection needs it to keep series in progress
+  // from being crowded out by fresh candidates.
   const alreadyTracked = await getRecentlySeenMarketIds(env.DB, HISTORY_WINDOW_DAYS);
 
-  await mapWithConcurrency(gated, SCORING_CONCURRENCY, async (candidate) => {
+  const selected = selectCandidates(discovered, alreadyTracked);
+  summary.selected = selected.length;
+
+  await mapWithConcurrency(selected, SCORING_CONCURRENCY, async (candidate) => {
     try {
       let pBeat = await fetchPBeat(candidate.yesTokenId);
       if (pBeat === null) pBeat = candidate.fallbackPBeat;
@@ -139,16 +167,11 @@ export async function runDiscoveryPass(env: Env): Promise<RunSummary> {
       const strength = computeTotalScore(pBeat, imbalance);
       summary.scored++;
 
-      // Record if the market is newly interesting, or if we are already
-      // tracking it - the latter keeps decays and reversals on the chart.
-      const isTracked = alreadyTracked.has(candidate.marketId);
-      if (strength < MIN_RECORD_SCORE && !isTracked) {
-        console.log(
-          `skip ${candidate.ticker}: strength ${strength} below record bar and not tracked`,
-        );
-        return;
-      }
-
+      // Everything selected gets a row. Selection is now signal-aware, so if a
+      // market was worth two subrequests it is worth one row - and a score of
+      // 0 is itself the data, whether it means "not across the filter yet" or
+      // "was across it and decayed". There is no separate record bar; a score
+      // gate here would drop the p_beat == 0.30 boundary and every radar row.
       const price = await fetchCurrentPrice(candidate.ticker, env, HISTORY_WINDOW_DAYS);
 
       await insertObservation(env.DB, {
@@ -159,6 +182,8 @@ export async function runDiscoveryPass(env: Env): Promise<RunSummary> {
         strength,
         current_stock_price: price,
         pm_url: candidate.pmUrl,
+        resolution_date: candidate.endDate,
+        volume: candidate.volume,
       });
       summary.recorded++;
 
@@ -174,7 +199,7 @@ export async function runDiscoveryPass(env: Env): Promise<RunSummary> {
   });
 
   console.log(
-    `run complete: discovered=${summary.discovered} gated=${summary.gated} ` +
+    `run complete: discovered=${summary.discovered} selected=${summary.selected} ` +
       `scored=${summary.scored} recorded=${summary.recorded} skipped=${summary.skipped}`,
   );
   return summary;

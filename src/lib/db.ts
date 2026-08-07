@@ -20,6 +20,13 @@ export interface SignalRow {
   strength: number;
   current_stock_price: number | null;
   pm_url: string | null;
+  /**
+   * Both added with the radar tier and both nullable, so rows written before
+   * migrations/0001_radar_tier.sql read back as null. Context for the card,
+   * never inputs to the score.
+   */
+  resolution_date: string | null;
+  volume: number | null;
   recorded_at: string;
 }
 
@@ -36,8 +43,9 @@ export async function insertObservation(db: D1Database, row: NewObservation): Pr
   await db
     .prepare(
       `INSERT INTO signal_history
-         (id, market_id, ticker, p_beat, imbalance, strength, current_stock_price, pm_url)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+         (id, market_id, ticker, p_beat, imbalance, strength, current_stock_price,
+          pm_url, resolution_date, volume)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       crypto.randomUUID(),
@@ -48,6 +56,8 @@ export async function insertObservation(db: D1Database, row: NewObservation): Pr
       row.strength,
       row.current_stock_price,
       row.pm_url,
+      row.resolution_date,
+      row.volume,
     )
     .run();
 }
@@ -55,9 +65,10 @@ export async function insertObservation(db: D1Database, row: NewObservation): Pr
 /**
  * Markets already seen inside the window.
  *
- * These are re-recorded on every subsequent run even when their score falls
- * back below the publication bar, which is the whole point: a signal decaying
- * or reversing is visible on the chart instead of the series just stopping.
+ * Read before selection, not after: these get a small ranking discount so a
+ * series in progress is not crowded out by fresh candidates. That is the whole
+ * point - a signal decaying or reversing stays visible on the chart instead of
+ * the series simply stopping.
  */
 export async function getRecentlySeenMarketIds(
   db: D1Database,
@@ -82,7 +93,7 @@ export async function getHistory(
   const { results } = await db
     .prepare(
       `SELECT id, market_id, ticker, p_beat, imbalance, strength,
-              current_stock_price, pm_url, recorded_at
+              current_stock_price, pm_url, resolution_date, volume, recorded_at
          FROM signal_history
         WHERE recorded_at >= datetime('now', ?)
         ORDER BY recorded_at ASC`,

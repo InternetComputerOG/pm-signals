@@ -64,18 +64,32 @@ every fill is folded onto the YES axis in `normalizeTrade` before it reaches the
 Skipping this inverts the conviction signal precisely in the markets that matter most — the ones
 where `P(beat)` is already low and NO is therefore the busy side.
 
-### Publication tiers
+### Three publication tiers
 
 `MIN_PUBLISH_SCORE` is 50, but it is used for *presentation*, not admission. With no whale flow to
 add, `computePeadsStrength` only reaches 50 when `P(beat) <= 0.05`, so a price-only signal would
-essentially never clear it and the page would sit empty. Instead:
+essentially never clear it and the page would sit empty. Every market the run scores gets a history
+row, and the tier is derived at render time:
 
-- Any market passing the primary filter (score `>= 1`) gets a history row.
-- Cards scoring `>= 50` render in the **conviction** tier.
-- Cards below it render in a de-emphasised **watchlist** tier.
+| Tier | Condition | Meaning |
+| --- | --- | --- |
+| **Conviction** | score `>= 50` | Inside the filter with whale flow behind it. |
+| **Watchlist** | `P(beat) <= 0.30`, score below 50 | Inside the filter, almost always price-only. |
+| **Radar** | `P(beat) > 0.30` | Not across the filter. Scores 0 by definition; tracked for drift. |
 
-Once a market has been recorded, it is re-recorded on every later run even if its score collapses,
-so a decaying or reversing signal stays visible on the chart instead of the line simply stopping.
+The radar tier exists because genuine signals are seasonal — they cluster in the days before
+resolution dates — and a page that shows nothing for weeks at a time is less useful than one
+showing weak, honestly-labelled observations. A market drifting 0.45 → 0.34 → 0.29 arrives at the
+filter with ten days of history behind it instead of appearing from nowhere as a single point.
+Since every radar card scores 0, that drift is also the only thing distinguishing them, so each
+card carries it alongside the book size and days to resolution.
+
+Selection guarantees a minimum number of tracked markets, so the page is populated whenever any
+earnings market is open at all. Tracked markets also get a small ranking preference, so a decaying
+or reversing signal stays visible on the chart instead of the line simply stopping.
+
+Note that `strength = 0` therefore means either "never crossed the filter" or "crossed and
+decayed". Read `p_beat` to tell them apart.
 
 ---
 
@@ -86,8 +100,10 @@ All of these live in [`src/lib/config.ts`](src/lib/config.ts).
 | Constant | Value | Source spec | Why it differs |
 | --- | --- | --- | --- |
 | `MIN_PUBLISH_SCORE` | 50 | 50 | Same value, but it now selects a card tier rather than gating the insert. |
-| `VOLUME_ABSOLUTE_FLOOR` | 5000 | 5000 (flat) | Kept, but now one half of an OR. |
-| `VOLUME_TOP_PERCENTILE` | 0.10 | — | A market qualifies on the absolute floor **or** by being in the top 10% of the current board. Measured live, *zero* of 26 open earnings markets cleared a flat 5000 — the largest was $4,333 — because volume only concentrates in the last days before resolution. |
+| `PEAD_FILTER_CEILING` | 0.30 | 0.30 | The paper's primary filter, restated as a constant so the renderer can derive tiers. |
+| `RADAR_PBEAT_CEILING` | 0.50 | — | Markets up to here are tracked for drift. Editorial, not empirical — the paper says nothing above 0.30. |
+| `MIN_TRACKED_MARKETS` | 6 | — | If fewer than six markets clear the ceiling, the cheapest remaining are tracked anyway. This is what keeps the page populated. |
+| `VOLUME_ABSOLUTE_FLOOR` | 5000 | 5000 (flat) | No longer gates anything. Now the threshold below which a card's book is marked thin. |
 | `LARGE_TRADE_ABSOLUTE_FLOOR` | 1000 | 1000 (flat) | Kept. |
 | `LARGE_TRADE_TOP_PERCENTILE` | 0.05 | — | A fill counts as a whale print only if it clears $1,000 **and** sits in the top 5% of that market's fills. Note this is a conjunction, so it is *stricter* than the spec, not looser. |
 | `TRADES_LIMIT` | 200 | 200 | Unchanged. |
@@ -101,6 +117,26 @@ a price-only signal in the watchlist tier. That is the honest outcome. Manufactu
 of $5 trades would be worse than reporting none. Liquidity rises sharply as resolution approaches,
 and the conviction tier fills in with it.
 
+### The volume gate, and why it is gone
+
+Earlier versions gated discovery on volume: a market qualified on a flat $5,000 floor **or** by
+being in the top 10% of the current board. It sounded reasonable and it emptied the dashboard.
+
+Because the gate ran before anything looked at price, ranking by volume decided which markets got
+scored at all. On the live board of 2026-08-07 — 26 open markets — it admitted exactly three: SPCE
+at `P(beat)` 0.85, HD at 0.79, and RKLB at 0.30 exactly, where `computePeadsStrength` still returns
+0. Five markets passed the primary filter and were all discarded for being illiquid: RUM at 0.185
+(would have scored 23), PLBY at 0.22 (16), GETY at 0.225 (15), HIMS and TBPH at 0.295 (1 each).
+The run recorded nothing, from a board carrying five signals.
+
+The error is directional, not merely conservative. Volume on earnings markets concentrates in the
+names the crowd expects to beat, so **selecting on liquidity selects against a short-side thesis**.
+Widening the gate would not have fixed it; the gate had to stop being the first filter.
+
+Selection now ranks on Gamma's own YES outcome price, which discovery already parses, so the fix
+costs no extra subrequest. Volume survives as the tiebreak and as a display marker. A regression
+test holds that entire 26-market board and asserts the five survive while SPCE and HD do not.
+
 ---
 
 ## Architecture
@@ -108,14 +144,15 @@ and the conviction tier fills in with it.
 ```
 Cron (every 12h)
   -> Gamma  /public-search?q=earnings   discover open markets
-  -> volume gate + ticker extraction + rank by volume, cap at 12
+  -> D1     tracked market ids          read first; selection needs it
+  -> select ticker extraction + rank by price, radar ceiling, floor, cap at 12
   -> CLOB   /midpoint                   P(beat)
   -> Data   /trades                     normalise to YES axis -> imbalance
   -> Alpaca /snapshot, /bars            stock price (optional)
-  -> D1     signal_history              one append-only row per observation
+  -> D1     signal_history              one append-only row per selected market
 
 HTTP
-  GET /            server-rendered cards, chart data embedded in the document
+  GET /            server-rendered cards in three tiers, chart data embedded
   GET /feed.json   the same rolling window as JSON
   GET /style.css   served from public/ by Workers Static Assets
 ```
@@ -124,6 +161,7 @@ HTTP
 .
 ├── wrangler.toml
 ├── schema.sql
+├── migrations/0001_radar_tier.sql
 ├── public/style.css
 └── src/
     ├── index.ts              Hono routes + scheduled handler
@@ -132,9 +170,9 @@ HTTP
         ├── polymarket.ts     Gamma + CLOB + Data clients, ticker extraction
         ├── alpaca.ts         snapshot + bars, degrades to null, never throws
         ├── signals.ts        pure scoring math
-        ├── pipeline.ts       the scheduled pass
+        ├── pipeline.ts       selection + the scheduled pass
         ├── db.ts             D1 helpers
-        └── render.ts         server-rendered HTML
+        └── render.ts         server-rendered HTML, tier derivation
 ```
 
 Discovery is completely stateless — every run rebuilds the candidate list from scratch. The only
@@ -179,9 +217,13 @@ npx wrangler d1 execute pead-whale --local \
 ```
 
 ```bash
-npm test        # 57 unit tests over the scoring math, rendering, and the Alpaca client
+npm test        # 92 unit tests over scoring, selection, rendering, and the Alpaca client
 npm run typecheck
 ```
+
+A local database created before the radar tier lacks the `resolution_date` and `volume` columns,
+and inserts will fail against it. Delete `.wrangler/state/v3/d1` and re-run `npm run db:local`;
+the local table is only ever a cache of a stateless discovery pass.
 
 ---
 
@@ -196,6 +238,14 @@ npx wrangler deploy
 ```
 
 Everything after the database id is in place is a single `wrangler deploy`.
+
+**A database created before the radar tier needs the migration first**, or every insert will fail
+on the two missing columns. SQLite has no `ADD COLUMN IF NOT EXISTS`, so this is kept out of
+`schema.sql`, which stays idempotent for fresh deploys:
+
+```bash
+npx wrangler d1 execute pead-whale --remote --file migrations/0001_radar_tier.sql
+```
 
 ### Secrets
 
@@ -240,20 +290,26 @@ The same rolling 10-day window the page uses, oldest first.
 ```json
 [
   {
-    "id": "81239f4c-ab14-4387-8f84-763ce62c6904",
-    "market_id": "0x0977f25e40d4bbc770246f6fa75c7353ce11a950a7c20ca83bb48ffb122c34df",
-    "ticker": "RKLB",
-    "p_beat": 0.29,
+    "id": "09ebbab7-ee7c-4a27-9ff1-62d8faa011b7",
+    "market_id": "0xb59315e5ce78261432af1a9292dba1f50fc7b12a4178e4b90596b92695b4c197",
+    "ticker": "BLSH",
+    "p_beat": 0.31,
     "imbalance": 0,
-    "strength": 2,
-    "current_stock_price": null,
-    "pm_url": "https://polymarket.com/event/rklb-quarterly-earnings-gaap-eps-08-10-2026-neg0pt08",
-    "recorded_at": "2026-08-07T14:53:25Z"
+    "strength": 0,
+    "current_stock_price": 23.35,
+    "pm_url": "https://polymarket.com/event/blsh-quarterly-earnings-gaap-eps-08-13-2026-1pt07",
+    "resolution_date": "2026-08-13T13:00:00Z",
+    "volume": 199.344113,
+    "recorded_at": "2026-08-07T18:52:43Z"
   }
 ]
 ```
 
 `imbalance` is in `[-1, 1]` and negative means net selling pressure against the beat.
+
+That row is a radar observation: `strength` is 0 because `p_beat` is above the 0.30 filter, not
+because anything failed. `resolution_date` and `volume` are null on rows written before those
+columns existed.
 
 ---
 
