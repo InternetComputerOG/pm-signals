@@ -8,7 +8,7 @@ binding = "DB"
 database_name = "pead-whale"
 # Replace with the id printed by `npx wrangler d1 create pead-whale`.
 # Local development works fine with this placeholder.
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "23bd155d-4989-4f25-9bbc-c2865cb093d3"
 
 # Serves public/style.css directly. Requests that match no asset fall through to
 # the Worker, so "/" and "/feed.json" are still handled by Hono.
