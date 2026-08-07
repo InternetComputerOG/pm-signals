@@ -15,9 +15,9 @@ database_id = "23bd155d-4989-4f25-9bbc-c2865cb093d3"
 [assets]
 directory = "./public"
 
-# One trigger, every 12 hours. The handler re-discovers everything from scratch.
+# One trigger, every hour. The handler re-discovers everything from scratch.
 [triggers]
-crons = ["0 */12 * * *"]
+crons = ["0 */1 * * *"]
 
 [observability]
 enabled = true
