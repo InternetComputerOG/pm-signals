@@ -30,9 +30,9 @@
 > ([Section 6](#6-publication--history-rules)). See [Section 18.10](#1810-the-volume-gate-selected-against-the-thesis)
 > for the evidence and [Section 19](#19-observed-baseline-2026-08-07) for the refreshed baseline.
 >
-> **v2.3 adds `POST /refresh`**, because deploying v2.2 exposed a gap the design had: the table is
-> written only by a cron that fires twice a day, so a deployment landing at 20:02 UTC showed an
-> empty page until midnight with nothing wrong. See
+> **v2.3 adds `POST /refresh` and a Refresh button on the page**, because deploying v2.2 exposed a
+> gap the design had: the table is written only by a cron that fires twice a day, so a deployment
+> landing at 20:02 UTC showed an empty page until midnight with nothing wrong. See
 > [Section 12](#post-refresh) for the endpoint and [Section 18.11](#1811-a-fresh-deployment-had-no-way-to-populate-itself)
 > for what the incident also revealed about the empty state's wording.
 
@@ -648,6 +648,21 @@ Server-rendered HTML.
   merely quiet board produces radar cards instead.
 - Tiny external stylesheet at `/style.css`. No auto-refresh meta tag.
 
+**The Refresh button** sits in the header, beside the disclaimer, and calls `POST /refresh`. It is
+in the header rather than the card grid on purpose: the state where it matters most is the empty
+one, and a control inside the grid would vanish exactly when it is needed. A test pins that it
+renders on the empty state.
+
+It is a real `<form method="post" action="/refresh">`, progressively enhanced. The script
+intercepts the submit, posts with `accept: application/json`, and reports the outcome in an
+`aria-live` region — "Recorded 7 of 26 open markets" on success, the wait on a 429, the status code
+on anything else — then reloads. With scripting off, or if `window.fetch` is absent, the listener
+is never attached and the plain form POST goes through; the route sees an HTML `Accept` header and
+answers `303` back to `/`, so the button degrades to a full page round trip instead of breaking.
+
+The script block is emitted **before** the Chart.js CDN tag and shares nothing with it, so an
+unreachable CDN cannot take the control down with it. That ordering is pinned by a test.
+
 **Chart axes.** Three series over one shared time axis built from `recorded_at`, using two y-axes:
 
 | Series | Axis | Style |
@@ -695,7 +710,8 @@ because anything failed. Consumers distinguishing tiers should read `p_beat`, pe
 ### `POST /refresh`
 
 Runs the scheduled pass on demand and returns its `RunSummary`, so a fresh deployment does not sit
-empty until the next cron.
+empty until the next cron. Called by the page's Refresh button (Section 12, `GET /`) and usable
+directly.
 
 ```bash
 curl -X POST https://pm-signals.small-unit-9fb3.workers.dev/refresh
@@ -723,6 +739,14 @@ Three decisions worth keeping:
   allowance, so an unbounded refresh is the one thing a visitor could use to break the free tier.
   The cron's own writes reset the timer too, which is correct: if data landed five minutes ago
   there is nothing to refresh.
+
+Putting a button on the public page in v2.3 raised the expected call rate substantially, and
+changed the exposure not at all: the cooldown caps the work at 6 passes an hour no matter how many
+people click. That property is why the endpoint could be shipped without a key in the first place.
+
+An HTML `Accept` header gets `303` to `/` instead of a JSON body, on both the success and cooldown
+paths. That is the no-JS form fallback described in Section 12; a 303 rather than 302 so the reload
+is a GET and the post cannot be resubmitted by a refresh.
 
 `cooldownRemainingSeconds` **fails open** — an empty table or an unparseable timestamp both permit
 the run. A fresh deployment has an empty table and is exactly the case the endpoint exists for, so
@@ -891,7 +915,7 @@ Specifics learned during implementation:
 
 ### 17.1 Testing
 
-105 tests across five files, all hermetic — no network, no database, no fixtures on disk.
+110 tests across five files, all hermetic — no network, no database, no fixtures on disk.
 
 - `signals.test.ts` — the scoring functions including boundary cases (`pBeat` exactly `0.30`,
   imbalance exactly `-0.30` / `-0.70`, the 60 and 100 caps), `topPercentileThreshold`,
@@ -903,7 +927,9 @@ Specifics learned during implementation:
   cap.
 - `render.test.ts` — tier derivation, ordering by *latest* strength with the `p_beat` tiebreak,
   section grouping, drift, resolution formatting, null-column degradation, the empty state, HTML
-  escaping, and `</script>` neutralisation in the embedded JSON.
+  escaping, `</script>` neutralisation in the embedded JSON, and the refresh control: that it
+  renders on the empty state, that it is a real form, and that its script precedes the Chart.js
+  tag.
 - `db.test.ts` — added in v2.3. `toIso`, and every branch of `cooldownRemainingSeconds`: the empty
   table, mid-window and elapsed-window, a future timestamp from clock skew, an unparseable value,
   a zero-minute cooldown, and the shipped `REFRESH_COOLDOWN_MINUTES`. One test pins that SQLite's

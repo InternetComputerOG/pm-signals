@@ -48,10 +48,17 @@ app.get("/feed.json", async (c) => {
  * could use to break the free tier.
  */
 app.post("/refresh", async (c) => {
+  // The page's button is a real <form>, so it still posts when its script does
+  // not run. A navigation wants a page back rather than a JSON body; the
+  // fetch() path sends `accept: application/json`, so this only catches the
+  // no-JS case. 303 so the reload is a GET and the post is not resubmittable.
+  const wantsHtml = c.req.header("accept")?.includes("text/html") ?? false;
+
   const latest = await latestRecordedAt(c.env.DB);
   const retryAfter = cooldownRemainingSeconds(latest, Date.now(), REFRESH_COOLDOWN_MINUTES);
 
   if (retryAfter > 0) {
+    if (wantsHtml) return c.redirect("/", 303);
     c.header("Retry-After", String(retryAfter));
     return c.json(
       {
@@ -63,7 +70,9 @@ app.post("/refresh", async (c) => {
     );
   }
 
-  return c.json({ status: "ok", ...(await runDiscoveryPass(c.env)) });
+  const summary = await runDiscoveryPass(c.env);
+  if (wantsHtml) return c.redirect("/", 303);
+  return c.json({ status: "ok", ...summary });
 });
 
 app.onError((err, c) => {

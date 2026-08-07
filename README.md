@@ -227,7 +227,7 @@ curl -X POST http://localhost:8787/refresh
 ```
 
 ```bash
-npm test        # 105 unit tests over scoring, selection, rendering, timestamps, and Alpaca
+npm test        # 110 unit tests over scoring, selection, rendering, timestamps, and Alpaca
 npm run typecheck
 ```
 
@@ -260,7 +260,14 @@ npx wrangler d1 execute pead-whale --remote --file migrations/0001_radar_tier.sq
 ### Populating a fresh deploy
 
 The cron fires at 00:00 and 12:00 UTC, so a deployment can be followed by up to 12 hours of an
-empty page with nothing actually wrong. Trigger a pass yourself instead:
+empty page with nothing actually wrong.
+
+The quickest fix is the **Refresh now** button in the page header — it calls the endpoint below,
+reports what the run recorded, and reloads. It sits in the header rather than among the cards
+because the state where it matters most is the empty one, and a control inside the grid would
+disappear exactly when it is needed.
+
+Or call it directly:
 
 ```bash
 curl -X POST https://your-worker.workers.dev/refresh
@@ -285,6 +292,16 @@ cost rather than disclosure: a pass spends ~37 subrequests against a finite dail
 unbounded refresh is the one thing a visitor could use to break the free tier. The cron's own
 writes reset the timer too, which is correct — if data landed five minutes ago there is nothing to
 refresh.
+
+Putting a button on a public page raises the expected call rate a lot and the exposure not at all,
+since the cooldown caps the work at 6 passes an hour however many people click. That is the
+property that let the endpoint ship without a key.
+
+The button is a real `<form method="post">`, progressively enhanced: with scripting it posts via
+`fetch`, writes the outcome into an `aria-live` region and reloads; without it, the plain form POST
+goes through and the route answers an HTML `Accept` header with a `303` back to `/`. Its script is
+emitted before the Chart.js tag and shares nothing with it, so an unreachable CDN cannot take the
+control down too.
 
 ### Secrets
 
@@ -326,7 +343,7 @@ per run against a 50 limit. There is no LLM inference anywhere in the system.
 
 | Route | Purpose |
 | --- | --- |
-| `GET /` | The dashboard: cards in three tiers, chart data embedded in the document. |
+| `GET /` | The dashboard: cards in three tiers, chart data embedded, and the Refresh button. |
 | `GET /feed.json` | The same rolling 10-day window as JSON, oldest first. |
 | `POST /refresh` | Runs the discovery pass on demand and returns its summary. Rate-limited; see above. |
 

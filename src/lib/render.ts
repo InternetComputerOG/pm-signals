@@ -304,7 +304,13 @@ export function renderPage(rows: SignalRow[], now: number = Date.now()): string 
       ${RADAR_PCT}% are tracked on the radar tier so their drift toward the filter is
       visible before they cross it. Charts cover the last ${HISTORY_WINDOW_DAYS} days.
     </p>
-    <span class="disclaimer">Showcase only &middot; not investment advice</span>
+    <div class="header-foot">
+      <span class="disclaimer">Showcase only &middot; not investment advice</span>
+      <form class="refresh" id="refresh-form" method="post" action="/refresh">
+        <button type="submit" id="refresh-btn">Refresh now</button>
+        <span class="refresh-status" id="refresh-status" role="status" aria-live="polite"></span>
+      </form>
+    </div>
   </header>
 
   <main>
@@ -320,6 +326,70 @@ ${body}
     </p>
   </footer>
 </div>
+
+<script>
+// Refresh button. Deliberately ahead of the Chart.js tag and independent of
+// it, so a CDN failure cannot take the control with it.
+(function () {
+  var form = document.getElementById('refresh-form');
+  var btn = document.getElementById('refresh-btn');
+  var out = document.getElementById('refresh-status');
+  if (!form || !btn || !out) return;
+
+  // Without fetch, leave the form alone: the plain POST still works, and the
+  // route answers a navigation with a redirect back to this page.
+  if (!window.fetch) return;
+
+  function say(text, cls) {
+    out.textContent = text;
+    out.className = 'refresh-status' + (cls ? ' ' + cls : '');
+  }
+
+  function wait(seconds) {
+    if (seconds >= 60) {
+      var m = Math.ceil(seconds / 60);
+      return m + ' minute' + (m === 1 ? '' : 's');
+    }
+    return seconds + ' second' + (seconds === 1 ? '' : 's');
+  }
+
+  form.addEventListener('submit', function (event) {
+    event.preventDefault();
+    btn.disabled = true;
+    say('Scanning the board\\u2026');
+
+    fetch('/refresh', { method: 'POST', headers: { accept: 'application/json' } })
+      .then(function (res) {
+        // An unhandled failure returns text/plain, so the body is read as text
+        // first and only then parsed - res.json() would throw on it.
+        return res.text().then(function (raw) {
+          var body = null;
+          try { body = JSON.parse(raw); } catch (err) {}
+          return { status: res.status, body: body };
+        });
+      })
+      .then(function (r) {
+        if (r.status === 429 && r.body) {
+          say('Just refreshed. Try again in ' + wait(r.body.retry_after_seconds) + '.');
+          btn.disabled = false;
+          return;
+        }
+        if (r.status !== 200 || !r.body) {
+          say('Refresh failed (HTTP ' + r.status + ').', 'error');
+          btn.disabled = false;
+          return;
+        }
+        say('Recorded ' + r.body.recorded + ' of ' + r.body.discovered +
+            ' open markets. Reloading\\u2026', 'ok');
+        window.setTimeout(function () { window.location.reload(); }, 800);
+      })
+      .catch(function (err) {
+        say('Refresh failed. ' + err.message, 'error');
+        btn.disabled = false;
+      });
+  });
+})();
+</script>
 
 <script src="${CHART_JS_CDN}"></script>
 <script>

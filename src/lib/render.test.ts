@@ -242,3 +242,39 @@ describe("renderPage", () => {
     expect(html).toContain('"price":[null]');
   });
 });
+
+describe("refresh control", () => {
+  it("renders on the empty state, which is where it is needed most", () => {
+    // A fresh deployment has nothing to show and no way to fix that from the
+    // page unless the button lives outside the card grid.
+    const html = renderPage([], NOW);
+    expect(html).toContain('id="refresh-btn"');
+    expect(html).toContain("No earnings markets open");
+  });
+
+  it("renders alongside cards too", () => {
+    const html = renderPage([row({ ticker: "AAA", strength: 22 })], NOW);
+    expect(html).toContain('id="refresh-btn"');
+  });
+
+  it("posts to /refresh as a real form, so it works without scripting", () => {
+    const html = renderPage([], NOW);
+    expect(html).toContain('method="post"');
+    expect(html).toContain('action="/refresh"');
+    expect(html).toContain('type="submit"');
+  });
+
+  it("gives the status region a live role for screen readers", () => {
+    const html = renderPage([], NOW);
+    expect(html).toContain('aria-live="polite"');
+  });
+
+  it("loads the refresh script before the Chart.js CDN tag", () => {
+    // The control must survive the CDN being unreachable.
+    const html = renderPage([row({ ticker: "AAA", strength: 22 })], NOW);
+    expect(html.indexOf("refresh-form")).toBeLessThan(html.indexOf("cdn.jsdelivr.net"));
+    expect(html.indexOf("getElementById('refresh-form')")).toBeLessThan(
+      html.indexOf("cdn.jsdelivr.net"),
+    );
+  });
+});
