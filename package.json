@@ -1,0 +1,24 @@
+{
+  "name": "pead-whale-feed",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Conditional PEAD-short + whale order-flow imbalance signals from Polymarket earnings markets. Showcase only, not a trading system.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --test-scheduled",
+    "deploy": "wrangler deploy",
+    "db:local": "wrangler d1 execute pead-whale --local --file=./schema.sql",
+    "db:remote": "wrangler d1 execute pead-whale --remote --file=./schema.sql",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "hono": "^4.13.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260804.1",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.7",
+    "wrangler": "^4.120.0"
+  }
+}

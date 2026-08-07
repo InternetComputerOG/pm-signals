@@ -1,0 +1,23 @@
+name = "pead-whale-feed"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+
+# Single D1 database holds all state. There is no KV, R2, Durable Object or queue.
+[[d1_databases]]
+binding = "DB"
+database_name = "pead-whale"
+# Replace with the id printed by `npx wrangler d1 create pead-whale`.
+# Local development works fine with this placeholder.
+database_id = "00000000-0000-0000-0000-000000000000"
+
+# Serves public/style.css directly. Requests that match no asset fall through to
+# the Worker, so "/" and "/feed.json" are still handled by Hono.
+[assets]
+directory = "./public"
+
+# One trigger, every 12 hours. The handler re-discovers everything from scratch.
+[triggers]
+crons = ["0 */12 * * *"]
+
+[observability]
+enabled = true
